@@ -1,7 +1,14 @@
 [project]
 name = "clipscript"
 version = "0.1.0"
-description = "Add your description here"
+description = "video-to-blog AI agent"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "fastapi>=0.115.12",
+    "gradio>=5.33.0",
+    "gradio-client>=1.10.2",
+    "modal>=1.0.2",
+    "requests>=2.32.3",
+    "yt-dlp>=2025.5.22",
+]
