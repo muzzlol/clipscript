@@ -25,9 +25,10 @@ asr_image = (
 
 app = modal.App(name="clipscript-asr-service")
 
-@app.cls(image=asr_image, gpu="A10G", concurrency_limit=20, container_idle_timeout=300)
+@app.cls(image=asr_image, gpu="A10G", scaledown_window=600)
 class ASR:
-    def __enter__(self):
+    @modal.enter()
+    def startup(self):
         import nemo.collections.asr as nemo_asr # type: ignore
         print("loading model...")
         self.model = nemo_asr.models.ASRModel.from_pretrained(MODEL_NAME)
