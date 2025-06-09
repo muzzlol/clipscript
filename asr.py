@@ -144,7 +144,6 @@ class ASR:
     @modal.method()
     def transcribe(self, audio_bytes: bytes, use_buffered: bool | None = None) -> dict[str, str]:
         import tempfile
-        from typing import Optional
         
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -172,7 +171,7 @@ class ASR:
             try:
                 import os
                 os.unlink(tmp.name)
-            except:
+            except Exception:
                 pass
 
     @modal.method()
