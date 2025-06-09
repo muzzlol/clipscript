@@ -9,6 +9,8 @@ dependencies = [
     "gradio>=5.33.0",
     "gradio-client>=1.10.2",
     "modal>=1.0.2",
+    "openai>=1.84.0",
+    "python-dotenv>=1.1.0",
     "requests>=2.32.3",
     "yt-dlp>=2025.5.22",
 ]
