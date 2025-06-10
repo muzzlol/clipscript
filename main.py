@@ -1,20 +1,47 @@
+from functools import wraps
+import logging
 import gradio as gr
-import requests
 import os
-import tempfile
-import subprocess
-from pathlib import Path
 import modal
-import shutil
 from openai import OpenAI
 from dotenv import load_dotenv
 import re
+import time
+import uuid
 
 load_dotenv()
 
-asr = modal.Cls.from_name("clipscript-asr-service", "ASR")
+
+process_media_remotely = modal.Function.from_name("clipscript-processing-service", "process_media")
+upload_volume = modal.Volume.from_name("clipscript-uploads", create_if_missing=True)
+
+
 llm = "deepseek/deepseek-r1-0528:free"
 api_key = os.environ.get("OPENROUTER_API_KEY")
+
+
+def retry_on_rate_limit(max_retries: int = 5, base_delay: float = 2.0):
+    """Decorator for exponential backoff on rate limits"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = base_delay
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    # Check for 429 status code in different ways
+                    status_code = getattr(getattr(e, 'response', None), 'status_code', None)
+                    if status_code == 429 or '429' in str(e) or 'rate limit' in str(e).lower():
+                        logging.warning(f"Rate limit hit. Retrying in {delay:.1f} seconds...")
+                        time.sleep(delay)
+                        delay *= 2
+                    else:
+                        raise
+            raise Exception("Max retries exceeded due to rate limits or other persistent errors.")
+        return wrapper
+    return decorator
+
 
 def extract_youtube_video_id(url: str) -> str:
     """Extract YouTube video ID from various YouTube URL formats."""
@@ -33,29 +60,37 @@ def get_youtube_thumbnail_url(video_id: str) -> str:
     """Get the high quality thumbnail URL for a YouTube video."""
     return f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
 
-def process_audio(file_or_url: str):
-    downloaded_path = None
-    wav_path = None
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=api_key,
+)
+
+def handle_transcription(file, url):
+    if not file and not (url and url.strip()):
+        gr.Warning("Please upload a file or enter a URL.")
+        return "Error: Please upload a file or enter a URL."
+
+    gr.Info("Starting secure transcription... This might take a moment.")
+    
     try:
-        if "youtube.com" in file_or_url or "youtu.be" in file_or_url:
-            print(f"Processing YouTube URL: {file_or_url}")
-            input_path = download_youtube_audio(file_or_url)
-            downloaded_path = input_path
-        elif file_or_url.startswith(("http://", "https://")):
-            print(f"Processing direct audio URL: {file_or_url}")
-            input_path = download_audio_url(file_or_url)
-            downloaded_path = input_path
-        else:
-            print(f"Processing uploaded file: {file_or_url}")
-            input_path = file_or_url
-
-        wav_path = convert_to_wav(input_path)
-
-        with open(wav_path, "rb") as f:
-            audio_bytes = f.read()
-
-        print("Sending audio to Modal for transcription...")
-        result = asr().transcribe.remote(audio_bytes)
+        result = None
+        if url and url.strip():
+            # Process URL remotely and securely.
+            print(f"Sending URL to Modal for processing: {url}")
+            result = process_media_remotely.remote(url=url)
+        elif file is not None:
+            # For file uploads:
+            # 1. Generate a unique ID for the file.
+            upload_id = f"upload-{uuid.uuid4()}"
+            print(f"Uploading file to Modal volume with ID: {upload_id}")
+            
+            # 2. Upload the local file to the remote volume 
+            with upload_volume.batch_upload() as batch:
+                batch.put_file(file, upload_id)
+            
+            # 3. Trigger remote processing by passing the upload ID.
+            print(f"Sending upload ID to Modal for processing: {upload_id}")
+            result = process_media_remotely.remote(upload_id=upload_id)
 
         if result.get("error"):
             return f"Error from ASR service: {result['error']}"
@@ -64,78 +99,14 @@ def process_audio(file_or_url: str):
 
     except Exception as e:
         print(f"An error occurred: {e}")
+        # It's good practice to remove the local temp file if it exists
+        if file and os.path.exists(file):
+            os.remove(file)
         return f"Error: {str(e)}"
     finally:
-        if downloaded_path and os.path.exists(downloaded_path):
-            os.remove(downloaded_path)
-        if wav_path and os.path.exists(wav_path):
-            os.remove(wav_path)
-
-def download_youtube_audio(url: str) -> str:
-    import yt_dlp
-
-    temp_dir = tempfile.mkdtemp()
-    try:
-        output_path = os.path.join(temp_dir, "audio.%(ext)s")
-
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": output_path,
-            "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "wav"}
-            ],
-            "quiet": True,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-
-        downloaded_files = list(Path(temp_dir).glob("*.wav"))
-        if not downloaded_files:
-            raise FileNotFoundError("yt-dlp failed to create a WAV file.")
-
-        source_path = downloaded_files[0]
-        fd, dest_path = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-        shutil.move(source_path, dest_path)
-
-        return dest_path
-    finally:
-        shutil.rmtree(temp_dir)
-
-def download_audio_url(url: str) -> str:
-    response = requests.get(url, stream=True, allow_redirects=True)
-    response.raise_for_status()
-
-    fd, path = tempfile.mkstemp()
-    with os.fdopen(fd, "wb") as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
-    return path
-
-def convert_to_wav(input_path: str) -> str:
-    fd, output_path = tempfile.mkstemp(suffix=".wav")
-    os.close(fd) 
-
-    print(f"Converting {input_path} to {output_path}...")
-    subprocess.run([
-        'ffmpeg', '-i', input_path, '-ar', '16000', '-ac', '1', '-y', output_path
-    ], check=True, capture_output=True)
-    return output_path
-
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=api_key,
-)
-
-def handle_transcription(file, url):
-    gr.Info("Starting transcription... This might take a moment.")
-    if file is not None:
-        return process_audio(file)
-    elif url and url.strip():
-        return process_audio(url)
-    else:
-        gr.Warning("Please upload a file or enter a URL.")
-        return "Error: Please upload a file or enter a URL."
+        # Gradio's gr.File widget creates a temporary file. We should clean it up.
+        if file and os.path.exists(file):
+            os.remove(file)
 
 def add_transcript_to_chat(transcript: str):
     if transcript.startswith("Error"):
@@ -148,11 +119,14 @@ def add_transcript_to_chat(transcript: str):
 def user_chat(user_message: str, history: list):
     return "", history + [{"role": "user", "content": user_message}]
 
+@retry_on_rate_limit(max_retries=3, base_delay=1.0)
 def _stream_chat_response(history: list, system_prompt: str, transcript: str = None):
     if not history and not transcript:
         # Don't do anything if there's no history and no transcript
         return
 
+    if transcript.startswith("Error"):
+        return
     # Include transcript as first user message if provided, but don't display it
     messages = [{"role": "system", "content": system_prompt}]
     if transcript:
@@ -174,7 +148,7 @@ def _stream_chat_response(history: list, system_prompt: str, transcript: str = N
             history[-1]["content"] = response_content
             yield history
 
-def generate_blog_post(history: list, transcript: str):
+def generate_blog_post(history: list, transcript: str, context: str):
     system_prompt = """You are an expert blog writer and editor. Your task is to transform a raw video transcription into a well-structured, engaging, and publish-ready blog post in Markdown format.
 Core Mandate: Erase the Video Origin
 This is a critical function. The reader must not know the content came from a video.
@@ -191,7 +165,13 @@ Remove all filler words (um, uh, like, you know).
 Fix grammar and consolidate rambling sentences.
 Flow: Start with a strong introduction and end with a concise summary or conclusion.
 Your output must be a complete, polished article in Markdown."""
-    yield from _stream_chat_response(history, system_prompt, transcript)
+    
+    # Combine transcript with additional context if provided
+    full_transcript = transcript
+    if context and context.strip():
+        full_transcript = f"{transcript}\n\n--- Additional Context ---\n{context.strip()}\n\nThis is some additional context relevant to the transcription above."
+    
+    yield from _stream_chat_response(history, system_prompt, full_transcript)
     
 def bot_chat(history: list):
     system_prompt = "You are a helpful assistant that helps refine a blog post created from an audio transcript. The user will provide instructions for changes and you will return only the updated blog post."
@@ -211,37 +191,52 @@ def update_thumbnail_display(url: str):
 
 # Gradio Interface
 theme = gr.themes.Ocean()
-
 with gr.Blocks(title="ClipScript", theme=theme) as demo:
-    gr.Markdown("# Turn your videos into blogs")
+    gr.Markdown("# 🎬➡️📝 ClipScript: Video-to-Blog Transformer", elem_classes="hero-title")
 
-    gr.Markdown("Upload an audio file, or provide a YouTube/direct URL.")
+    gr.Markdown("### Upload an audio file, or provide a YouTube/direct URL *of any size*.")
     with gr.Row():
-        file_input = gr.File(label="Upload any audio file", type="filepath", scale=3, height=300)
+        # Column 1: File input, URL input, and thumbnail
+        with gr.Column(scale=1.5):
+            file_input = gr.File(label="Upload any audio file", type="filepath", height=200)
+            
+            with gr.Row():
+                with gr.Column():
+                    url_input = gr.Textbox(
+                        label="YouTube or Direct Audio URL",
+                        placeholder="https://www.youtube.com/watch?v=...",
+                        scale=2,
+                        elem_classes="ellipsis-text"
+                    )
+            
+                # YouTube thumbnail display
+                thumbnail_display = gr.Image(
+                    label="Thumbnail",
+                    visible=False,
+                    height=100,
+                    show_download_button=False,
+                    interactive=False,
+                    scale=2
+                )
         
+        # Column 2: Transcript view
         with gr.Column(scale=2):
-            url_input = gr.Textbox(
-                label="YouTube or Direct Audio URL",
-                placeholder="https://www.youtube.com/watch?v=...",
-            )
-            # YouTube thumbnail display
-            thumbnail_display = gr.Image(
-                label="Video Thumbnail",
-                visible=False,
-                height=200,
-                show_download_button=False,
-                interactive=False
-            )
+            transcript_output = gr.Textbox(label="Transcription POWERED by Modal Labs", lines=12, interactive=True, show_copy_button=True)
 
     transcribe_button = gr.Button("Blogify", variant="primary")
 
     gr.Markdown("---")
 
-    with gr.Accordion("View Transcript", open=False):
-        transcript_output = gr.Textbox(label="Transcript", lines=15, interactive=False)
+    # Add Context section
+    context_input = gr.Textbox(
+        label="Additional Context",
+        placeholder="Enter any additional context, code, articles, or any references that relate to the video content...",
+        lines=5,
+        interactive=True
+    )
 
     chatbot = gr.Chatbot(
-        label="Blog Post", type="messages", height=500
+        label="Blog Post", type="messages", height=500, show_copy_all_button=True, show_copy_button=True, show_share_button=True
     )
     chat_input = gr.Textbox(
         label="Your message",
@@ -276,12 +271,17 @@ with gr.Blocks(title="ClipScript", theme=theme) as demo:
             outputs=transcript_output,
         )
         .then(
+            fn=lambda: gr.update(value=None, interactive=True),
+            outputs=file_input,
+            queue=False,
+        )
+        .then(
             fn=add_transcript_to_chat,
             inputs=transcript_output,
             outputs=chatbot,
             queue=False,
         )
-        .then(fn=generate_blog_post, inputs=[chatbot, transcript_output], outputs=chatbot)
+        .then(fn=generate_blog_post, inputs=[chatbot, transcript_output, context_input], outputs=chatbot)
     )
 
     # Event handler for follow-up chat

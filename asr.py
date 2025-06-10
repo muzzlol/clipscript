@@ -23,26 +23,39 @@ asr_image = (
         extra_options="-U",
         gpu="A10G",
     )
-
     .run_function(
         download_model,
         gpu="A10G",
     )
 )
 
+with asr_image.imports():
+    import nemo.collections.asr as nemo_asr # type: ignore
+    from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecodingConfig # type: ignore
+    from nemo.collections.asr.parts.utils.streaming_utils import BatchedFrameASRTDT # type: ignore
+    from nemo.collections.asr.parts.utils.transcribe_utils import get_buffered_pred_feat_rnnt # type: ignore
+    import math
+    import torch # type: ignore
+    from omegaconf import OmegaConf # type: ignore
+    import librosa # type: ignore
+    import os
+
 app = modal.App(name="clipscript-asr-service")
 
-@app.cls(image=asr_image, gpu="A10G", scaledown_window=600)
+# This must be the same volume object used in processing.py
+upload_volume = modal.Volume.from_name(
+    "clipscript-uploads", create_if_missing=True
+)
+
+@app.cls(
+    image=asr_image,
+    gpu="A10G",
+    scaledown_window=600,
+    volumes={"/data": upload_volume},  # Mount the shared volume
+)
 class ASR:
     @modal.enter()
     def startup(self):
-        import nemo.collections.asr as nemo_asr # type: ignore
-        from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecodingConfig # type: ignore
-        import math
-        import torch # type: ignore
-        from omegaconf import OmegaConf # type: ignore
-
-        
         print("loading model...")
         self.model = nemo_asr.models.ASRModel.from_pretrained(MODEL_NAME)
         print("model loaded.")
@@ -84,12 +97,10 @@ class ASR:
 
     def _get_audio_duration(self, audio_path: str) -> float:
         try:
-            import librosa # type: ignore
             duration = librosa.get_duration(path=audio_path)
             return duration
         except Exception:
             # Fallback: estimate from file size (rough approximation)
-            import os
             file_size = os.path.getsize(audio_path)
             # Rough estimate: 16kHz, 16-bit mono = ~32KB per second
             return file_size / 32000
@@ -104,10 +115,6 @@ class ASR:
         return output[0].text
     
     def _buffered_transcribe(self, audio_path: str) -> str:
-        from nemo.collections.asr.parts.utils.streaming_utils import BatchedFrameASRTDT # type: ignore
-        from nemo.collections.asr.parts.utils.transcribe_utils import get_buffered_pred_feat_rnnt # type: ignore
-        import math
-        
         print("Using buffered transcription...")
         
         # Setup TDT frame processor
@@ -142,44 +149,34 @@ class ASR:
         return ""
 
     @modal.method()
-    def transcribe(self, audio_bytes: bytes, use_buffered: bool | None = None) -> dict[str, str]:
-        import tempfile
-        
+    def transcribe(self, audio_filename: str, use_buffered: bool | None = None) -> dict[str, str]:
         try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp.write(audio_bytes)
-                tmp.flush()
-                
-                # Determine transcription method
-                if use_buffered is None:
-                    duration = self._get_audio_duration(tmp.name)
-                    use_buffered = duration > 1800.0  # 30 minutes
-                    print(f"Audio duration: {duration:.1f}s, using {'buffered' if use_buffered else 'simple'} transcription")
-                
-                if use_buffered:
-                    text = self._buffered_transcribe(tmp.name)
-                else:
-                    text = self._simple_transcribe(tmp.name)
-                
-                print("transcription complete.")
-                return {"text": text, "error": ""}
-                
+            audio_path = f"/data/{audio_filename}"
+            
+            # Determine transcription method
+            if use_buffered is None:
+                duration = self._get_audio_duration(audio_path)
+                use_buffered = duration > 1800.0  # 30 minutes
+                print(f"Audio duration: {duration:.1f}s, using {'buffered' if use_buffered else 'simple'} transcription")
+            
+            if use_buffered:
+                text = self._buffered_transcribe(audio_path)
+            else:
+                text = self._simple_transcribe(audio_path)
+            
+            print("transcription complete.")
+            return {"text": text, "error": ""}
+            
         except Exception as e:
             print(f"Transcription error: {e}")
             return {"text": "", "error": str(e)}
-        finally:
-            try:
-                import os
-                os.unlink(tmp.name)
-            except Exception:
-                pass
 
     @modal.method()
-    def transcribe_simple(self, audio_bytes: bytes) -> dict[str, str]:
+    def transcribe_simple(self, audio_filename: str) -> dict[str, str]:
         """Force simple transcription (for compatibility)"""
-        return self.transcribe(audio_bytes, use_buffered=False)
+        return self.transcribe(audio_filename, use_buffered=False)
     
     @modal.method()
-    def transcribe_buffered(self, audio_bytes: bytes) -> dict[str, str]:
+    def transcribe_buffered(self, audio_filename: str) -> dict[str, str]:
         """Force buffered transcription"""
-        return self.transcribe(audio_bytes, use_buffered=True)
+        return self.transcribe(audio_filename, use_buffered=True)
