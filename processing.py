@@ -1,16 +1,13 @@
 import modal
-import os
 import uuid
 
 sandbox_image = (
     modal.Image.debian_slim()
     .apt_install("ffmpeg")
-    .pip_install("yt-dlp")
 )
 
 app = modal.App(
     "clipscript-processing-service",
-    secrets=[modal.Secret.from_name("youtube-cookies")]
 )
 
 asr_handle = modal.Cls.from_name("clipscript-asr-service", "ASR")
@@ -22,7 +19,6 @@ upload_volume = modal.Volume.from_name(
 
 @app.function(
     image=sandbox_image,
-    secrets=[modal.Secret.from_name("youtube-cookies")],
     volumes={"/data": upload_volume},
     cpu=2.0,
     memory=4096,
@@ -35,103 +31,93 @@ upload_volume = modal.Volume.from_name(
 )
 def process_media(url: str = None, upload_id: str = None):
     """
-    Securely processes media from a URL or a file from the upload Volume.
+    Securely processes media from a URL or a file from the upload Volume using a Sandbox.
 
     This function orchestrates a Sandbox to perform the download and conversion,
-    then passes the result to the ASR service.
+    then passes the resulting audio bytes to the ASR service.
     """
     output_filename = f"processed-{uuid.uuid4()}.wav"
-    # The sandbox mounts the volume at /data, so we write the output there.
-    output_wav_path_in_sandbox = f"/data/{output_filename}"
-    cookie_path_in_sandbox = "/tmp/cookies.txt"
+    output_wav_path_in_sandbox = f"/tmp/{output_filename}"
+    audio_bytes = None
 
     sb = None
     try:
+        volumes = {"/data": upload_volume} if upload_id else {}
+        
         sb = modal.Sandbox.create(
             image=sandbox_image,
-            volumes={"/data": upload_volume},
+            volumes=volumes,
         )
         
-        # Check if the secret env var is present in this function's environment.
-        cookie_data = os.environ.get("YOUTUBE_COOKIES")
-        use_cookies = False
-        if cookie_data:
-            print("Found youtube-cookies secret, writing it to the sandbox.")
-            # Use the sandbox's filesystem API to write the cookie data to a file inside it.
-            with sb.open(cookie_path_in_sandbox, "w") as f:
-                f.write(cookie_data)
-            use_cookies = True
-
+        cmd = []
         if url:
-            print(f"Sandbox: Downloading and converting from URL: {url}")
-            # Use yt-dlp to extract audio and convert to WAV in one command.
+            print(f"Sandbox: Downloading and converting from non-YouTube URL: {url}")
             cmd = [
-                "yt-dlp",
-                "--extract-audio",
-                "--audio-format", "wav",
-                "--output", output_wav_path_in_sandbox,
-            ]
-            
-            if use_cookies:
-                cmd.extend(["--cookies", cookie_path_in_sandbox])
-
-            cmd.extend(["--", url])
-            
-            p = sb.exec(*cmd)
-            p.wait()
-
-            if p.returncode != 0:
-                stderr = p.stderr.read()
-                raise RuntimeError(f"yt-dlp execution failed: {stderr}")
-
-        elif upload_id:
-            print(f"Sandbox: Converting uploaded file: {upload_id}")
-            # The uploaded file is at /data/{upload_id} inside the sandbox.
-            uploaded_file_path = f"/data/{upload_id}"
-            cmd = [
-                'ffmpeg', '-i', uploaded_file_path,
+                'ffmpeg', '-i', url,
                 '-ar', '16000', '-ac', '1', '-y', output_wav_path_in_sandbox
             ]
-            p = sb.exec(*cmd)
-            p.wait()
-
-            if p.returncode != 0:
-                stderr = p.stderr.read()
-                raise RuntimeError(f"ffmpeg execution failed: {stderr}")
+        elif upload_id:
+            print(f"Sandbox: Converting uploaded file: {upload_id}")
+            # Input path is on the mounted volume
+            uploaded_file_path_in_sandbox = f"/data/{upload_id}"
+            cmd = [
+                'ffmpeg', '-i', uploaded_file_path_in_sandbox,
+                '-ar', '16000', '-ac', '1', '-y', output_wav_path_in_sandbox
+            ]
         else:
             raise ValueError("Either 'url' or 'upload_id' must be provided.")
 
-        print("Sandbox: Process complete. WAV data written to shared volume.")
+        print("Sandbox: Executing FFMPEG...")
+        p = sb.exec(*cmd)
+        p.wait()
 
+        if p.returncode != 0:
+            stderr = p.stderr.read()
+            raise RuntimeError(f"ffmpeg execution failed: {stderr}")
+
+        print("Sandbox: Process complete. Reading WAV data from sandbox's filesystem.")
+        
+        # Read the file directly from the sandbox's filesystem.
+        with sb.open(output_wav_path_in_sandbox, "rb") as f:
+            audio_bytes = f.read()
+
+    except Exception as e:
+        print(f"Error during sandbox processing: {e}")
+        raise
     finally:
         if sb:
             print("Terminating sandbox.")
             sb.terminate()
 
-    print(f"Sending filename '{output_filename}' to ASR service.")
+    if not audio_bytes:
+        raise RuntimeError("Processing failed to produce audio data.")
+
+    # If we processed a user upload, we can now clean up the original file.
+    if upload_id:
+        try:
+            print(f"Cleaning up original upload {upload_id} from volume.")
+            upload_volume.remove_file(upload_id)
+            upload_volume.commit()
+        except Exception as e:
+            # This is not a critical error, so we just warn.
+            print(f"Warning: Failed to clean up {upload_id} from volume: {e}")
+
+    print("Sending audio bytes to ASR service.")
     
     # Retry ASR service call with exponential backoff
     max_asr_retries = 3
+    result = None
     for attempt in range(max_asr_retries):
         try:
-            # Pass the filename (string) NOT the audio bytes.
-            # Note: it's asr_handle.transcribe, not asr_handle().transcribe
-            result = asr_handle.transcribe.remote(output_filename)
+            # Pass the audio bytes directly to the ASR service
+            result = asr_handle.transcribe.remote(audio_bytes=audio_bytes)
             break
         except Exception as e:
             if attempt == max_asr_retries - 1:
                 raise e
-            wait_time = 2 ** attempt  # exponential backoff: 1s, 2s, 4s
+            wait_time = 2 ** attempt
             print(f"ASR service attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
             import time
             time.sleep(wait_time)
-
-    # Clean up the processed WAV file as well
-    try:
-        print(f"Cleaning up {output_filename} from volume.")
-        upload_volume.remove_file(output_filename)
-        upload_volume.commit()
-    except Exception as e:
-        print(f"Warning: Failed to clean up {output_filename} from volume: {e}")
 
     return result 

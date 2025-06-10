@@ -1,4 +1,5 @@
 import modal
+import uuid
 
 MODEL_NAME = "nvidia/parakeet-tdt-0.6b-v2"
 
@@ -149,9 +150,23 @@ class ASR:
         return ""
 
     @modal.method()
-    def transcribe(self, audio_filename: str, use_buffered: bool | None = None) -> dict[str, str]:
+    def transcribe(self, audio_filename: str = None, audio_bytes: bytes = None, use_buffered: bool | None = None) -> dict[str, str]:
+        audio_path = None
+        temp_audio_path = None
         try:
-            audio_path = f"/data/{audio_filename}"
+            if audio_filename:
+                audio_path = f"/data/{audio_filename}"
+            elif audio_bytes:
+                # When bytes are passed, they must be written to a file for librosa/nemo to read.
+                temp_audio_path = f"/tmp/input_{uuid.uuid4()}.wav"
+                with open(temp_audio_path, "wb") as f:
+                    f.write(audio_bytes)
+                audio_path = temp_audio_path
+            else:
+                raise ValueError("Either 'audio_filename' or 'audio_bytes' must be provided.")
+            
+            if not os.path.exists(audio_path):
+                return {"text": "", "error": f"Audio file not found at path: {audio_path}"}
             
             # Determine transcription method
             if use_buffered is None:
@@ -170,13 +185,16 @@ class ASR:
         except Exception as e:
             print(f"Transcription error: {e}")
             return {"text": "", "error": str(e)}
+        finally:
+            if temp_audio_path and os.path.exists(temp_audio_path):
+                os.remove(temp_audio_path)
 
     @modal.method()
-    def transcribe_simple(self, audio_filename: str) -> dict[str, str]:
+    def transcribe_simple(self, audio_filename: str = None, audio_bytes: bytes = None) -> dict[str, str]:
         """Force simple transcription (for compatibility)"""
-        return self.transcribe(audio_filename, use_buffered=False)
+        return self.transcribe(audio_filename=audio_filename, audio_bytes=audio_bytes, use_buffered=False)
     
     @modal.method()
-    def transcribe_buffered(self, audio_filename: str) -> dict[str, str]:
+    def transcribe_buffered(self, audio_filename: str = None, audio_bytes: bytes = None) -> dict[str, str]:
         """Force buffered transcription"""
-        return self.transcribe(audio_filename, use_buffered=True)
+        return self.transcribe(audio_filename=audio_filename, audio_bytes=audio_bytes, use_buffered=True)

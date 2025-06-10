@@ -8,11 +8,16 @@ from dotenv import load_dotenv
 import re
 import time
 import uuid
+import yt_dlp
+import tempfile
+import shutil
+from pathlib import Path
 
 load_dotenv()
 
 
 process_media_remotely = modal.Function.from_name("clipscript-processing-service", "process_media")
+asr_handle = modal.Cls.from_name("clipscript-asr-service", "ASR")
 upload_volume = modal.Volume.from_name("clipscript-uploads", create_if_missing=True)
 
 
@@ -65,6 +70,46 @@ client = OpenAI(
     api_key=api_key,
 )
 
+def download_and_convert_youtube_audio(url: str) -> str:
+    """
+    Downloads audio from a YouTube URL and converts it to a 16kHz mono WAV file.
+    Uses a temporary directory for all intermediate files, ensuring cleanup.
+    Returns the path to the final temporary WAV file.
+    """
+    temp_dir = tempfile.mkdtemp()
+    try:
+        output_tmpl = os.path.join(temp_dir, "audio.%(ext)s")
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": output_tmpl,
+            "postprocessors": [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'wav',
+            }],
+            'postprocessor_args': {
+                'extractaudio': ['-ar', '16000', '-ac', '1']
+            },
+            "quiet": True,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        # Find the downloaded .wav file
+        downloaded_files = list(Path(temp_dir).glob("*.wav"))
+        if not downloaded_files:
+            raise FileNotFoundError("yt-dlp failed to create a WAV file. The video might be protected or unavailable.")
+
+        # Move the final file to a new temporary location so we can clean up the directory
+        source_path = downloaded_files[0]
+        fd, dest_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        shutil.move(source_path, dest_path)
+        
+        return dest_path
+    finally:
+        shutil.rmtree(temp_dir)
+
 def handle_transcription(file, url):
     if not file and not (url and url.strip()):
         gr.Warning("Please upload a file or enter a URL.")
@@ -75,9 +120,28 @@ def handle_transcription(file, url):
     try:
         result = None
         if url and url.strip():
-            # Process URL remotely and securely.
-            print(f"Sending URL to Modal for processing: {url}")
-            result = process_media_remotely.remote(url=url)
+            video_id = extract_youtube_video_id(url)
+            if video_id:
+                converted_wav_path = None
+                try:
+                    print(f"Detected YouTube URL. Processing locally: {url}")
+                    converted_wav_path = download_and_convert_youtube_audio(url)
+                    
+                    # Read audio bytes and call ASR service
+                    with open(converted_wav_path, "rb") as f:
+                        audio_bytes = f.read()
+
+                    print("Sending audio bytes to ASR service.")
+                    result = asr_handle().transcribe.remote(audio_bytes=audio_bytes)
+                finally:
+                    # Clean up the final temp file
+                    if converted_wav_path and os.path.exists(converted_wav_path):
+                        os.remove(converted_wav_path)
+
+            else:
+                # Process other URLs remotely and securely.
+                print(f"Sending URL to Modal for processing: {url}")
+                result = process_media_remotely.remote(url=url)
         elif file is not None:
             # For file uploads:
             # 1. Generate a unique ID for the file.
@@ -197,14 +261,14 @@ with gr.Blocks(title="ClipScript", theme=theme) as demo:
     gr.Markdown("### Upload an audio file, or provide a YouTube/direct URL *of any size*.")
     with gr.Row():
         # Column 1: File input, URL input, and thumbnail
-        with gr.Column(scale=1.5):
-            file_input = gr.File(label="Upload any audio file", type="filepath", height=200)
+        with gr.Column(scale=1):
+            file_input = gr.File(label="Upload any audio file", type="filepath", height=200, file_types=["audio", ".webm", ".mp3", ".mp4", ".m4a", ".ogg", ".wav"])
             
             with gr.Row():
                 with gr.Column():
                     url_input = gr.Textbox(
-                        label="YouTube or Direct Audio URL",
-                        placeholder="https://www.youtube.com/watch?v=...",
+                        label="YouTube(Recommended) or Direct Audio URL",
+                        placeholder="youtube.com/watch?v=... OR xyz.com/audio.mp3",
                         scale=2,
                         elem_classes="ellipsis-text"
                     )
