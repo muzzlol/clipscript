@@ -77,7 +77,17 @@ def download_and_convert_youtube_audio(url: str) -> str:
     Returns the path to the final temporary WAV file.
     """
     temp_dir = tempfile.mkdtemp()
+    cookie_file_path = None
     try:
+        # Check for YouTube cookies in secrets and write to a temporary file
+        youtube_cookies = os.environ.get("YOUTUBE_COOKIES")
+        if youtube_cookies:
+            # Use NamedTemporaryFile to handle the file creation and cleanup
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as tmp_cookie_file:
+                tmp_cookie_file.write(youtube_cookies)
+                cookie_file_path = tmp_cookie_file.name
+            print("Using YouTube cookies from secrets.")
+
         output_tmpl = os.path.join(temp_dir, "audio.%(ext)s")
         ydl_opts = {
             "format": "bestaudio/best",
@@ -91,6 +101,10 @@ def download_and_convert_youtube_audio(url: str) -> str:
             },
             "quiet": True,
         }
+        
+        # Add cookiefile to options if it exists
+        if cookie_file_path:
+            ydl_opts['cookiefile'] = cookie_file_path
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -108,6 +122,9 @@ def download_and_convert_youtube_audio(url: str) -> str:
         
         return dest_path
     finally:
+        # Clean up the cookie file if it was created
+        if cookie_file_path and os.path.exists(cookie_file_path):
+            os.remove(cookie_file_path)
         shutil.rmtree(temp_dir)
 
 def handle_transcription(file, url):
@@ -163,12 +180,10 @@ def handle_transcription(file, url):
 
     except Exception as e:
         print(f"An error occurred: {e}")
-        # It's good practice to remove the local temp file if it exists
         if file and os.path.exists(file):
             os.remove(file)
         return f"Error: {str(e)}"
     finally:
-        # Gradio's gr.File widget creates a temporary file. We should clean it up.
         if file and os.path.exists(file):
             os.remove(file)
 
@@ -189,7 +204,7 @@ def _stream_chat_response(history: list, system_prompt: str, transcript: str = N
         # Don't do anything if there's no history and no transcript
         return
 
-    if transcript.startswith("Error"):
+    if transcript and transcript.startswith("Error"):
         return
     # Include transcript as first user message if provided, but don't display it
     messages = [{"role": "system", "content": system_prompt}]
@@ -262,15 +277,14 @@ with gr.Blocks(title="ClipScript", theme=theme) as demo:
     with gr.Row():
         # Column 1: File input, URL input, and thumbnail
         with gr.Column(scale=1):
-            file_input = gr.File(label="Upload any audio file", type="filepath", height=200, file_types=["audio", ".webm", ".mp3", ".mp4", ".m4a", ".ogg", ".wav"])
+            file_input = gr.File(label="Upload any audio file (Recommended)", type="filepath", height=200, file_types=["audio", ".webm", ".mp3", ".mp4", ".m4a", ".ogg", ".wav"])
             
             with gr.Row():
                 with gr.Column():
                     url_input = gr.Textbox(
-                        label="YouTube(Recommended) or Direct Audio URL",
+                        label="YouTube or Direct Audio URL",
                         placeholder="youtube.com/watch?v=... OR xyz.com/audio.mp3",
-                        scale=2,
-                        elem_classes="ellipsis-text"
+                        scale=2
                     )
             
                 # YouTube thumbnail display
