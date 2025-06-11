@@ -5,7 +5,7 @@ MODEL_NAME = "nvidia/parakeet-tdt-0.6b-v2"
 
 def download_model():
     try: 
-        import nemo.collections.asr as nemo_asr # type: ignore
+        import nemo.collections.asr as nemo_asr
         nemo_asr.models.ASRModel.from_pretrained(MODEL_NAME)
     except ImportError:
         pass
@@ -31,14 +31,14 @@ asr_image = (
 )
 
 with asr_image.imports():
-    import nemo.collections.asr as nemo_asr # type: ignore
-    from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecodingConfig # type: ignore
-    from nemo.collections.asr.parts.utils.streaming_utils import BatchedFrameASRTDT # type: ignore
-    from nemo.collections.asr.parts.utils.transcribe_utils import get_buffered_pred_feat_rnnt # type: ignore
+    import nemo.collections.asr as nemo_asr 
+    from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecodingConfig 
+    from nemo.collections.asr.parts.utils.streaming_utils import BatchedFrameASRTDT 
+    from nemo.collections.asr.parts.utils.transcribe_utils import get_buffered_pred_feat_rnnt 
     import math
-    import torch # type: ignore
-    from omegaconf import OmegaConf # type: ignore
-    import librosa # type: ignore
+    import torch 
+    from omegaconf import OmegaConf 
+    import librosa 
     import os
 
 app = modal.App(name="clipscript-asr-service")
@@ -171,7 +171,7 @@ class ASR:
             # Determine transcription method
             if use_buffered is None:
                 duration = self._get_audio_duration(audio_path)
-                use_buffered = duration > 1800.0  # 30 minutes
+                use_buffered = duration > 1200.0  # 20 minutes
                 print(f"Audio duration: {duration:.1f}s, using {'buffered' if use_buffered else 'simple'} transcription")
             
             if use_buffered:
